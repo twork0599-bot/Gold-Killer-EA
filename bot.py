@@ -4,30 +4,53 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import requests
-import yfinance as yf
 
-SYMBOL = "GC=F"  # Yahoo gold-futures proxy, not Exness XAUUSDm.
-
-
-def fetch_data(interval: str, period: str) -> pd.DataFrame:
-    data = yf.download(SYMBOL, period=period, interval=interval,
-                       auto_adjust=False, progress=False, threads=False)
-    if data is None or data.empty:
-        raise RuntimeError(f"No market data returned for {interval}.")
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    data.columns = [str(c).title() for c in data.columns]
-    needed = ["Open", "High", "Low", "Close"]
-    if any(c not in data.columns for c in needed):
-        raise RuntimeError("Market data is missing OHLC columns.")
-    return data.dropna(subset=needed).copy()
+# Free public XAU/USD spot feed. Indicative mid-market, not Exness bid/ask.
+API_URL = "https://xaus.com/api/v1/intraday"
+HEADERS = {"User-Agent": "Gold-Killer-EA/1.0"}
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def fetch_bars():
+    response = requests.get(
+        API_URL, params={"symbol": "xau", "hours": 48},
+        headers=HEADERS, timeout=20
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    state = payload.get("data_state") or {}
+    if state.get("status") != "fresh":
+        raise RuntimeError(
+            f"Gold feed is not fresh (status={state.get('status')}, "
+            f"as_of={state.get('as_of')}). No signal sent."
+        )
+
+    points = payload.get("points") or []
+    if len(points) < 100:
+        raise RuntimeError(f"Not enough intraday observations: {len(points)}")
+
+    df = pd.DataFrame(points)
+    df["time"] = pd.to_datetime(df["t"], unit="s", utc=True)
+    df["price"] = pd.to_numeric(df["p"], errors="coerce")
+    df = df.dropna(subset=["time", "price"]).set_index("time").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    bars = {}
+    for interval in ("15min", "1h"):
+        ohlc = df["price"].resample(interval).ohlc().dropna()
+        if len(ohlc) < 35:
+            raise RuntimeError(
+                f"Not enough {interval} bars ({len(ohlc)}); wait for more feed history."
+            )
+        bars[interval] = ohlc
+    return bars, state
+
+
+def add_indicators(df, fast=20, slow=50):
     d = df.copy()
-    c = d["Close"]
-    d["ema50"] = c.ewm(span=50, adjust=False).mean()
-    d["ema200"] = c.ewm(span=200, adjust=False).mean()
+    c = d["close"]
+    d["ema_fast"] = c.ewm(span=fast, adjust=False).mean()
+    d["ema_slow"] = c.ewm(span=slow, adjust=False).mean()
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
@@ -37,30 +60,33 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d["macd"] = macd
     d["macd_signal"] = macd.ewm(span=9, adjust=False).mean()
     prev = c.shift(1)
-    tr = pd.concat([d["High"] - d["Low"],
-                    (d["High"] - prev).abs(),
-                    (d["Low"] - prev).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        d["high"] - d["low"],
+        (d["high"] - prev).abs(),
+        (d["low"] - prev).abs()
+    ], axis=1).max(axis=1)
     d["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
     return d.dropna()
 
 
-def trend(row) -> str:
-    if row["ema50"] > row["ema200"] and row["macd"] > row["macd_signal"]:
+def trend(row):
+    if row["ema_fast"] > row["ema_slow"] and row["macd"] > row["macd_signal"]:
         return "BUY"
-    if row["ema50"] < row["ema200"] and row["macd"] < row["macd_signal"]:
+    if row["ema_fast"] < row["ema_slow"] and row["macd"] < row["macd_signal"]:
         return "SELL"
     return "HOLD"
 
 
-def build_message() -> str:
-    m15 = add_indicators(fetch_data("15m", "60d"))
-    h1 = add_indicators(fetch_data("1h", "730d"))
+def build_message():
+    bars, state = fetch_bars()
+    m15 = add_indicators(bars["15min"], fast=20, slow=50)
+    h1 = add_indicators(bars["1h"], fast=10, slow=20)
     a, b = m15.iloc[-1], h1.iloc[-1]
     t15, t1h = trend(a), trend(b)
-    price, atr, rsi = float(a["Close"]), float(a["atr"]), float(a["rsi"])
+    price, atr, rsi = float(a["close"]), float(a["atr"]), float(a["rsi"])
+
     signal = "HOLD"
     entry = sl = tp1 = tp2 = tp3 = None
-
     if t15 == t1h == "BUY" and 45 <= rsi <= 70:
         signal, entry = "BUY", price
         sl, tp1, tp2, tp3 = entry-1.5*atr, entry+1.5*atr, entry+2.5*atr, entry+3.5*atr
@@ -69,42 +95,51 @@ def build_message() -> str:
         sl, tp1, tp2, tp3 = entry+1.5*atr, entry-1.5*atr, entry-2.5*atr, entry-3.5*atr
 
     score = 50 + (20 if t15 == t1h and t15 != "HOLD" else 0)
-    if signal == "BUY" and 50 <= rsi <= 65 or signal == "SELL" and 35 <= rsi <= 50:
-        score += 10
     if signal != "HOLD":
-        score += 10
+        score += 20
     score = min(score, 90)
     fmt = lambda x: f"{x:,.2f}" if x is not None else "—"
     lines = [
-        "🥇 GOLD KILLER — MARKET ANALYSIS",
+        "🥇 GOLD KILLER — XAU/USD SPOT ANALYSIS",
         f"Signal: {signal}",
-        f"Reference price (GC=F): {fmt(price)}",
+        f"Reference spot price: {fmt(price)} USD/oz",
         f"15m trend: {t15} | 1h trend: {t1h}",
         f"RSI(14): {rsi:.1f} | ATR(14): {fmt(atr)}",
         f"Rule-alignment score: {score}/100 (not win probability)"
     ]
     if signal != "HOLD":
-        lines += [f"Entry: {fmt(entry)}", f"Stop Loss: {fmt(sl)}",
-                  f"TP1: {fmt(tp1)}", f"TP2: {fmt(tp2)}", f"TP3: {fmt(tp3)}",
-                  "TP1 risk/reward: 1:1",
-                  "Risk reminder: maximum 2% of account equity; calculate position size yourself."]
+        lines += [
+            f"Indicative entry: {fmt(entry)}",
+            f"Indicative Stop Loss: {fmt(sl)}",
+            f"TP1: {fmt(tp1)} | TP2: {fmt(tp2)} | TP3: {fmt(tp3)}",
+            "TP1 risk/reward: 1:1",
+            "Risk reminder: maximum 2% of account equity; calculate position size yourself."
+        ]
     else:
         lines.append("No aligned setup. Wait for confirmation.")
+
     lines += [
-        f"Updated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}",
+        f"Feed status: {state.get('status')} | As of: {state.get('as_of')}",
+        f"Bot checked: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}",
         "",
-        "WARNING: GC=F is a Yahoo gold-futures proxy, NOT the live Exness XAUUSDm feed. Prices and timing may differ. Verify on your broker. Educational analysis only; no trades are placed."
+        "DATA WARNING: Free XAUS XAU/USD indicative spot feed, sampled intraday. "
+        "It is NOT the Exness MT5 XAUUSDm bid/ask or broker candles. "
+        "Spread, execution price and timing may differ. Verify on MT5 before any decision. "
+        "Educational analysis only; no trades are placed."
     ]
     return "\n".join(lines)
 
 
 def main():
-    token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub Actions secret.")
+    message = build_message()
     response = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": build_message()}, timeout=25)
+        json={"chat_id": chat_id, "text": message}, timeout=25
+    )
     response.raise_for_status()
     result = response.json()
     if not result.get("ok"):
